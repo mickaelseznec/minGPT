@@ -10,13 +10,65 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 
+import time
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
 from mingpt.utils import CfgNode as CN
 
+
+from build import gpt
+USE_CUSTOM_LAYERS = False
+
+def activate_custom_layers(use: bool):
+    global USE_CUSTOM_LAYERS
+    USE_CUSTOM_LAYERS = use
+
 # -----------------------------------------------------------------------------
+class NewLinear(nn.Linear):
+    """
+    Subclass torch.nn.Linear that can call your custom CUDA matmul implementation
+    """
+    def forward(self, input):
+        global USE_CUSTOM_LAYERS
+        if USE_CUSTOM_LAYERS:
+            input_s = input
+            if input.ndim > 2:
+                input_s = input.squeeze(0)
+
+            output_shape = input_s.shape[:-1] + (self.out_features,)
+            output = torch.zeros(output_shape, device=input.device)
+            gpt.linear(output, input_s, self.weight, self.bias)
+            if input.ndim > 2:
+                output = output.unsqueeze(0)
+
+            return output
+        else:
+            return F.linear(input, self.weight, self.bias)
+
+
+class NewLayerNorm(nn.LayerNorm):
+    """
+    Subclass torch.nn.LayerNorm that can call your custom CUDA layernorm implementation
+    """
+    def forward(self, input):
+        global USE_CUSTOM_LAYERS
+        if USE_CUSTOM_LAYERS:
+            input_s = input
+            if input.ndim > 2:
+                input_s = input.squeeze(0)
+
+            output = torch.zeros_like(input_s)
+            gpt.layernorm(output, input_s, self.weight, self.bias, self.eps)
+
+            if input.ndim > 2:
+                output = output.unsqueeze(0)
+
+            return output
+        else:
+            return F.layer_norm(input, self.normalized_shape, self.weight, self.bias, self.eps)
+
 
 class NewGELU(nn.Module):
     """
@@ -24,7 +76,18 @@ class NewGELU(nn.Module):
     Reference: Gaussian Error Linear Units (GELU) paper: https://arxiv.org/abs/1606.08415
     """
     def forward(self, x):
-        return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
+        global USE_CUSTOM_LAYERS
+        if USE_CUSTOM_LAYERS:
+            xs = x
+            if x.ndim > 2:
+                xs = x.squeeze(0)
+            output = torch.zeros_like(xs)
+            gpt.gelu(output, xs)
+            if x.ndim > 2:
+                output = output.unsqueeze(0)
+            return output
+        else:
+            return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
 
 class CausalSelfAttention(nn.Module):
     """
@@ -37,9 +100,9 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        self.c_attn = NewLinear(config.n_embd, 3 * config.n_embd)
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj = NewLinear(config.n_embd, config.n_embd)
         # regularization
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
@@ -49,7 +112,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
-    def forward(self, x):
+    def forward(self, x, kv_cache=None, layer_idx=None, history_len=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -57,6 +120,18 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        if kv_cache is not None:
+            # NOTE: Here you should take care of the KV cache to speed-up generation.
+            #       - You should pre-allocate a full size KV cache in the `generate` method with shape
+            #       (L, B, nh, S, hs), where L is the layer_idx and S the total sequence length.
+            #       - You should maintain a list of current history for selecting the right portion of the KV cache
+            #       At prefill, the history_len should be 0 (indicating that there's no history for the moment),
+            #       Remember that you can assume that batch size it 1.
+            #       Here, your code should do the following:
+            #       1. write the keys and queries just computed to the KV cache (be careful about the current layer idx and seq len) 
+            #       2. select the right portion of the KV cache to use to performm the attention
+            pass
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -75,20 +150,20 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.ln_1 = NewLayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.ln_2 = NewLayerNorm(config.n_embd)
         self.mlp = nn.ModuleDict(dict(
-            c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd),
-            c_proj  = nn.Linear(4 * config.n_embd, config.n_embd),
+            c_fc    = NewLinear(config.n_embd, 4 * config.n_embd),
+            c_proj  = NewLinear(4 * config.n_embd, config.n_embd),
             act     = NewGELU(),
             dropout = nn.Dropout(config.resid_pdrop),
         ))
         m = self.mlp
         self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x)))) # MLP forward
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, kv_cache=None, layer_idx=None, history_len=None):
+        x = x + self.attn(self.ln_1(x), kv_cache, layer_idx, history_len)
         x = x + self.mlpf(self.ln_2(x))
         return x
 
@@ -197,7 +272,7 @@ class GPT(nn.Module):
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla nn.Linear.
         # this means that we have to transpose these weights when we import them
-        assert len(keys) == len(sd)
+        # assert len(keys) == len(sd)
         for k in keys:
             if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights we need to transpose
@@ -257,7 +332,9 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
         return optimizer
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, kv_cache=None, history_len=None):
+        # NOTE: You can always assume that batch_size == 1
+
         device = idx.device
         b, t = idx.size()
         assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
@@ -267,29 +344,34 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
+        for idx, block in enumerate(self.transformer.h):
+            x = block(x, kv_cache, idx, history_len)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
 
         # if we are given some desired targets also calculate the loss
         loss = None
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k=None, use_custom_layers=False):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        activate_custom_layers(use_custom_layers)
+        timings = []
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
             # forward the model to get the logits for the index in the sequence
+            torch.cuda.synchronize()
+            start_time = time.monotonic()
+
+            # NOTE: Here is the forward pass. You can add arguments for the KV cache and history len.
+            #       See comment above in the CausalSelfAttention module.
             logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
@@ -304,7 +386,10 @@ class GPT(nn.Module):
                 idx_next = torch.multinomial(probs, num_samples=1)
             else:
                 _, idx_next = torch.topk(probs, k=1, dim=-1)
+            torch.cuda.synchronize()
+
+            timings.append(time.monotonic() - start_time)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 
-        return idx
+        return idx, timings
